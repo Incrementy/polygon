@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Polygon Pathfinder</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+:root {
+  color-scheme: dark;
+  --bg:#050506;
+  --panel:#16181b;
+  --panel-border:#2a2d30;
+  --text:#cccccc;
+  --text-dim:#888888;
+  --accent:#ffffff;
+  --grid:#14161a;
+  font-family: system-ui, Segoe UI, Arial, sans-serif;
+}
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none;}
+body{margin:0;background:var(--bg);color:var(--text);overflow:hidden;font-size:14px;line-height:1.35;}
+#ui{
+  position:fixed;top:8px;left:8px;
+  background:rgba(22,24,27,.55);
+  border:1px solid rgba(42,45,48,.6);
+  padding:10px 12px 12px;max-width:520px;border-radius:4px;
+  backdrop-filter:blur(8px);
+}
+h1{font-size:15px;margin:0 0 6px;font-weight:600;letter-spacing:.5px;color:var(--accent);}
+#buttons{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}
+button{
+  background:#1b1e21;color:var(--text);border:1px solid #2a2e32;
+  padding:5px 10px;font-size:12px;border-radius:3px;cursor:pointer;font-weight:500;letter-spacing:.3px;
+  transition:background .15s,color .15s,border-color .15s;
+}
+button:hover{background:#22262a;}
+button:active{background:#2a2e32;}
+#status{margin-top:4px;font-size:12px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto;scrollbar-width:thin;}
+#lengthDisplay{margin-top:6px;font-size:12px;color:var(--accent);font-weight:500;}
+#toggles{display:flex;flex-direction:column;gap:6px;margin:6px 0 4px;font-size:12px;}
+label.toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;}
+label.toggle input,#objectRadius{accent-color:#666;cursor:pointer;}
+#objectWrap{display:flex;align-items:center;gap:8px;}
+#objectRadius{width:160px;}
+#toast{
+  position:fixed;bottom:12px;left:50%;transform:translateX(-50%);
+  background:#141618;border:1px solid #262a2d;padding:8px 14px;border-radius:4px;font-size:12px;color:#d0d0d0;
+  opacity:0;pointer-events:none;transition:opacity .3s;
+}
+#toast.show{opacity:1;}
+#canvas{position:absolute;inset:0;touch-action:none;cursor:crosshair;}
+*{scrollbar-width:thin;scrollbar-color:#2d3134 #16181b;}
+*::-webkit-scrollbar{width:8px;height:8px;}
+*::-webkit-scrollbar-track{background:#16181b;}
+*::-webkit-scrollbar-thumb{background:#2d3134;border-radius:4px;}
+*::-webkit-scrollbar-thumb:hover{background:#353b3f;}
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <h1>Polygon Pathfinder</h1>
+  <div id="buttons">
+    <button id="undoBtn" title="Undo Vertex">Undo</button>
+    <button id="cancelBtn" title="Cancel Polygon">Cancel</button>
+    <button id="clearBtn" title="Clear All">Clear</button>
+  </div>
+  <div id="toggles">
+    <label class="toggle"><input type="checkbox" id="snapToggle"> Snap to vertices</label>
+    <label class="toggle"><input type="checkbox" id="showGraphToggle"> Show visibility graph</label>
+    <label class="toggle"><input type="checkbox" id="showIndicesToggle"> Show vertex indices</label>
+    <label class="toggle"><input type="checkbox" id="showLatticeToggle" checked> Show lattice</label>
+    <label class="toggle"><input type="checkbox" id="showHeatmapToggle"> Show heatmap (path distance)</label>
+    <div id="objectWrap">
+      <span style="min-width:108px;">Object radius</span>
+      <input type="range" id="objectRadius" min="0" max="3" value="0" step="0.05">
+      <span id="objectVal">0.00</span>
+      <span style="color:#888;">units</span>
+    </div>
+  </div>
+  <div id="lengthDisplay">
+    Path Length: <span id="pathLen">—</span> (grid units)
+    | Detour Index: <span id="detourIdx">—</span>
+  </div>
+  <div id="status"></div>
+</div>
+<div id="toast"></div>
+<script>
+(function(){
+"use strict";
+
+/* ===== Core State ===== */
+const canvas=document.getElementById("canvas");
+const ctx=canvas.getContext("2d");
+const pathLenEl=document.getElementById("pathLen");
+const detourEl=document.getElementById("detourIdx");
+const statusEl=document.getElementById("status");
+const snapToggle=document.getElementById("snapToggle");
+const showGraphToggle=document.getElementById("showGraphToggle");
+const showIndicesToggle=document.getElementById("showIndicesToggle");
+const showLatticeToggle=document.getElementById("showLatticeToggle");
+const showHeatmapToggle=document.getElementById("showHeatmapToggle");
+const objectRadiusInput=document.getElementById("objectRadius");
+const objectValEl=document.getElementById("objectVal");
+const undoBtn=document.getElementById("undoBtn");
+const cancelBtn=document.getElementById("cancelBtn");
+const clearBtn=document.getElementById("clearBtn");
+const toastEl=document.getElementById("toast");
+
+const polygons=[];
+let inflatedPolygons=[];
+
+let constructing=false;
+let currentPoly=[];
+let startPoint={x:160,y:160,r:10,color:"#ffffff"};
+let endPoint={x:420,y:340,r:10,color:"#888888"};
+let draggingPoint=null;
+let dragOffset={x:0,y:0};
+
+let visibilityNodes=[];
+let graphAdj=[];
+let pathIndices=[];
+let pathDirty=true;
+
+let distToEnd=[];
+let distMapDirty=true;
+let heatmapNormMax=1;
+
+let heatmapEnabled=false;
+
+/* MUCH FINER HEATMAP GRID (position-based; world-aligned) */
+const heatmapLevels=[
+  {maxZoom:0.5, cell:64},
+  {maxZoom:1.0, cell:32},
+  {maxZoom:2.0, cell:16},
+  {maxZoom:4.0, cell:8},
+  {maxZoom:8.0, cell:4},
+  {maxZoom:Infinity, cell:2}
+];
+let currentHeatmapCellSize=16;
+
+/* Per-cell cache (world-grid keyed) and offscreen tile */
+const heatmapCellCache=new Map(); // key: `${cell}|${ix}|${iy}|${version}`
+let heatmapVersion=0;
+let offscreenHeatmapCanvas=document.createElement("canvas");
+let offscreenHeatmapCtx=offscreenHeatmapCanvas.getContext("2d",{alpha:true});
+let needOffscreenRebuild=true;
+let lastViewportKey="";
+
+/* Interaction */
+let panning=false;
+let panStart={x:0,y:0};
+let panOffset={x:0,y:0};
+let panOffsetStart={x:0,y:0};
+let mouseDownInfo=null;
+let lastMouseScreen={x:window.innerWidth/2,y:window.innerHeight/2};
+let rebuildTimer=null;
+
+let objectRadiusUnits=0;
+const gridSize=40;
+let zoom=1;
+const minZoom=0.2,maxZoom=14;
+const EPS=1e-7;
+let arcEdges=[];
+let useZeroMode=true;
+let needsRedraw=true;
+let animationRunning=false;
+
+/* ===== Utils ===== */
+function clamp(v,a,b){return v<a?a:v>b?b:v;}
+function toast(msg,t=1400){
+  toastEl.textContent=msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastEl._timer);
+  toastEl._timer=setTimeout(()=>toastEl.classList.remove("show"),t);
+}
+function setStatus(){
+  const lines=[];
+  lines.push(`Polygons: ${polygons.length}`);
+  if(constructing) lines.push(`Constructing: ${currentPoly.length} vertices`);
+  lines.push(`Graph nodes: ${visibilityNodes.length}`);
+  if(pathIndices.length) lines.push(`Path nodes: ${pathIndices.length}`);
+  lines.push(`Heatmap cell (world): ${currentHeatmapCellSize}`);
+  statusEl.textContent=lines.join("\n");
+}
+function resize(){canvas.width=window.innerWidth;canvas.height=window.innerHeight;needsRedraw=true;needOffscreenRebuild=true;requestFrame();}
+window.addEventListener("resize",resize,{passive:true});resize();
+
+/* ===== Geometry Helpers ===== */
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+function orientation(ax,ay,bx,by,cx,cy){const v=(by-ay)*(cx-bx)-(bx-ax)*(cy-by);return v>0?1:v<0?-1:0;}
+function onSegment(ax,ay,bx,by,px,py){return Math.min(ax,bx)<=px+EPS&&px<=Math.max(ax,bx)+EPS&&Math.min(ay,by)<=py+EPS&&py<=Math.max(ay,by)+EPS;}
+function segmentsProperlyIntersect(a,b,c,d){
+  const o1=orientation(a.x,a.y,b.x,b.y,c.x,c.y),o2=orientation(a.x,a.y,b.x,b.y,d.x,d.y),o3=orientation(c.x,c.y,d.x,d.y,a.x,a.y),o4=orientation(c.x,c.y,d.x,d.y,b.x,b.y);
+  if(o1!==o2&&o3!==o4)return true;
+  if(o1===0&&onSegment(a.x,a.y,b.x,b.y,c.x,c.y))return true;
+  if(o2===0&&onSegment(a.x,a.y,b.x,b.y,d.x,d.y))return true;
+  if(o3===0&&onSegment(c.x,c.y,d.x,d.y,a.x,a.y))return true;
+  if(o4===0&&onSegment(c.x,c.y,d.x,d.y,b.x,b.y))return true;
+  return false;
+}
+function shareEndpoint(a,b,c,d){
+  return (Math.abs(a.x-c.x)<1e-9&&Math.abs(a.y-c.y)<1e-9)||(Math.abs(a.x-d.x)<1e-9&&Math.abs(a.y-d.y)<1e-9)||
+         (Math.abs(b.x-c.x)<1e-9&&Math.abs(b.y-c.y)<1e-9)||(Math.abs(b.x-d.x)<1e-9&&Math.abs(b.y-d.y)<1e-9);
+}
+function pointInPolygon(pt,poly){
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const xi=poly[i].x,yi=poly[i].y,xj=poly[j].x,yj=poly[j].y;
+    const inter=((yi>pt.y)!==(yj>pt.y))&&(pt.x<(xj-xi)*(pt.y-yi)/(yj-yi+1e-12)+xi);
+    if(inter) inside=!inside;
+  }
+  return inside;
+}
+function pointSegmentDistance(p,a,b){
+  const vx=b.x-a.x,vy=b.y-a.y,wx=p.x-a.x,wy=p.y-a.y,den=vx*vx+vy*vy;
+  let t=den?((wx*vx+wy*vy)/den):0;t=t<0?0:t>1?1:t;
+  const cx=a.x+t*vx,cy=a.y+t*vy;return Math.hypot(p.x-cx,p.y-cy);
+}
+function segmentsDistance(a,b,c,d){
+  if(segmentsProperlyIntersect(a,b,c,d))return 0;
+  return Math.min(pointSegmentDistance(a,c,d),pointSegmentDistance(b,c,d),pointSegmentDistance(c,a,b),pointSegmentDistance(d,a,b));
+}
+function signedArea(poly){let s=0;for(let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];s+=a.x*b.y-b.x*a.y;}return 0.5*s;}
+function normalize(v){const m=Math.hypot(v.x,v.y);return m<1e-12?{x:0,y:0}:{x:v.x/m,y:v.y/m};}
+function perpLeft(u){return {x:-u.y,y:u.x};}
+function perpRight(u){return {x:u.y,y:-u.x};}
+function normalizeAngle(a){while(a<=-Math.PI)a+=2*Math.PI;while(a>Math.PI)a-=2*Math.PI;return a;}
+function lineIntersection(p,r,q,s){const rxs=r.x*s.y-r.y*s.x;if(Math.abs(rxs)<1e-12)return null;const t=((q.x-p.x)*s.y-(q.y-p.y)*s.x)/rxs;return {x:p.x+t*r.x,y:p.y+t*r.y};}
+function arcPoints(center,a1,a2,dir,R,stepsPerRad=12){
+  let diff=normalizeAngle(a2-a1);
+  if(dir==='cw'){if(diff>0)diff-=2*Math.PI;}else{if(diff<0)diff+=2*Math.PI;}
+  const steps=Math.max(2,Math.ceil(Math.abs(diff)*stepsPerRad));
+  const pts=[];
+  for(let k=0;k<=steps;k++){const t=k/steps;const ang=a1+diff*t;pts.push({x:center.x+Math.cos(ang)*R,y:center.y+Math.sin(ang)*R,ang});}
+  return pts;
+}
+function chooseOutsideArcDir(poly,center,a1,a2,R){
+  function mid(a,b,dir){let d=normalizeAngle(b-a);if(dir==='cw'){if(d>0)d-=2*Math.PI;}else{if(d<0)d+=2*Math.PI;}return a+d*0.5;}
+  const mcw=mid(a1,a2,'cw'),pCW={x:center.x+Math.cos(mcw)*R,y:center.y+Math.sin(mcw)*R};
+  const mccw=mid(a1,a2,'ccw'),pCCW={x:center.x+Math.cos(mccw)*R,y:center.y+Math.sin(mccw)*R};
+  const outCW=!pointInPolygon(pCW,poly),outCCW=!pointInPolygon(pCCW,poly);
+  if(outCW&&!outCCW)return 'cw';
+  if(outCCW&&!outCW)return 'ccw';
+  const d=normalizeAngle(a2-a1);const lenCW=Math.abs(d>0?d-2*Math.PI:d),lenCCW=Math.abs(d<0?d+2*Math.PI:d);
+  return lenCW<lenCCW?'cw':'ccw';
+}
+
+/* ===== Hitbox Inflation (heatmap mode only) ===== */
+function inflatePolygon(poly,R){
+  if(poly.length<3||R<=0) return poly.slice();
+  const ccw=signedArea(poly)>0;
+  const out=[];
+  for(let i=0;i<poly.length;i++){
+    const prev=poly[(i-1+poly.length)%poly.length],curr=poly[i],next=poly[(i+1)%poly.length];
+    const u_prev=normalize({x:curr.x-prev.x,y:curr.y-prev.y});
+    const u_next=normalize({x:next.x-curr.x,y:next.y-curr.y});
+    const outward_prev=ccw?perpRight(u_prev):perpLeft(u_prev);
+    const outward_next=ccw?perpRight(u_next):perpLeft(u_next);
+    const crossTurn=u_prev.x*u_next.y-u_prev.y*u_next.x;
+    const isConvex=ccw?crossTurn>0:crossTurn<0;
+    const p1={x:curr.x+outward_prev.x*R,y:curr.y+outward_prev.y*R};
+    const p2={x:curr.x+outward_next.x*R,y:curr.y+outward_next.y*R};
+    if(isConvex){
+      const a1=Math.atan2(outward_prev.y,outward_prev.x);
+      const a2=Math.atan2(outward_next.y,outward_next.x);
+      const dir=chooseOutsideArcDir(poly,curr,a1,a2,R);
+      const arc=arcPoints(curr,a1,a2,dir,R,12);
+      for(const pt of arc) out.push(pt);
+    }else{
+      const inter=lineIntersection(p1,u_prev,p2,u_next);
+      out.push(inter?inter:{x:(p1.x+p2.x)/2,y:(p1.y+p2.y)/2});
+    }
+  }
+  return out;
+}
+function rebuildInflated(){
+  inflatedPolygons=[];
+  if(!heatmapEnabled) return;
+  const R=objectRadiusUnits*gridSize;
+  if(R<=EPS) return;
+  for(const poly of polygons) inflatedPolygons.push(inflatePolygon(poly,R));
+}
+
+/* ===== Hitbox membership ===== */
+function pointInHitbox(p){
+  if(!heatmapEnabled || objectRadiusUnits<=EPS){
+    for(let i=0;i<polygons.length;i++) if(pointInPolygon(p,polygons[i])) return i;
+    return -1;
+  }
+  for(let i=0;i<inflatedPolygons.length;i++) if(pointInPolygon(p,inflatedPolygons[i])) return i;
+  return -1;
+}
+
+/* ===== Segment validators ===== */
+function segmentValidZeroIgnore(a,b,ignore=-1){
+  if(a===b)return false;
+  for(let pi=0;pi<polygons.length;pi++){
+    if(pi===ignore) continue;
+    const poly=polygons[pi];
+    for(let i=0;i<poly.length;i++){
+      const v1=poly[i],v2=poly[(i+1)%poly.length];
+      if(shareEndpoint(a,b,v1,v2)) continue;
+      if(segmentsProperlyIntersect(a,b,v1,v2)) return false;
+    }
+    const mid={x:(a.x+b.x)/2,y:(a.y+b.y)/2};
+    if(pointInPolygon(mid,poly)) return false;
+  }
+  return true;
+}
+function segmentValidClearanceIgnore(a,b,ignore=-1){
+  if(a===b)return false;
+  for(let pi=0;pi<polygons.length;pi++){
+    if(pi===ignore) continue;
+    const poly=polygons[pi];
+    if(pointInPolygon(a,poly)||pointInPolygon(b,poly)) return false;
+  }
+  for(let pi=0;pi<polygons.length;pi++){
+    if(pi===ignore) continue;
+    const poly=polygons[pi];
+    for(let i=0;i<poly.length;i++){
+      const v1=poly[i],v2=poly[(i+1)%poly.length];
+      if(shareEndpoint(a,b,v1,v2)) continue;
+      if(segmentsProperlyIntersect(a,b,v1,v2)) return false;
+    }
+  }
+  const R=objectRadiusUnits*gridSize;
+  if(R>EPS){
+    for(let pi=0;pi<polygons.length;pi++){
+      if(pi===ignore) continue;
+      const poly=polygons[pi];
+      for(let i=0;i<poly.length;i++){
+        const v1=poly[i],v2=poly[(i+1)%poly.length];
+        if(segmentsDistance(a,b,v1,v2)<R-EPS) return false;
+      }
+    }
+  }
+  return true;
+}
+function segmentValidZero(a,b){return segmentValidZeroIgnore(a,b,-1);}
+function segmentValidClearance(a,b){return segmentValidClearanceIgnore(a,b,-1);}
+
+/* ===== Visibility ===== */
+function buildNodesWithArcs(){
+  visibilityNodes=[];arcEdges=[];
+  visibilityNodes.push({x:startPoint.x,y:startPoint.y,type:"start"});
+  visibilityNodes.push({x:endPoint.x,y:endPoint.y,type:"end"});
+  const R=objectRadiusUnits*gridSize;
+  const stepsPerRad=12;
+  for(let pi=0;pi<polygons.length;pi++){
+    const poly=polygons[pi],ccw=signedArea(poly)>0;
+    for(let vi=0;vi<poly.length;vi++){
+      const prev=poly[(vi-1+poly.length)%poly.length],curr=poly[vi],next=poly[(vi+1)%poly.length];
+      visibilityNodes.push({x:curr.x,y:curr.y,type:"vertex",polyIndex:pi,vertexIndex:vi});
+      if(R<=EPS) continue;
+      const u_prev=normalize({x:curr.x-prev.x,y:curr.y-prev.y});
+      const u_next=normalize({x:next.x-curr.x,y:next.y-curr.y});
+      const outward_prev=ccw?perpRight(u_prev):perpLeft(u_prev);
+      const outward_next=ccw?perpRight(u_next):perpLeft(u_next);
+      const crossTurn=u_prev.x*u_next.y-u_prev.y*u_next.x;
+      const isConvex=ccw?crossTurn>0:crossTurn<0;
+      if(!isConvex) continue;
+      const a1=Math.atan2(outward_prev.y,outward_prev.x);
+      const a2=Math.atan2(outward_next.y,outward_next.x);
+      const dir=chooseOutsideArcDir(poly,curr,a1,a2,R);
+      const arc=arcPoints(curr,a1,a2,dir,R,stepsPerRad);
+      const idxs=[];
+      for(const p of arc){
+        if(!pointInPolygon(p,poly)){
+          idxs.push(visibilityNodes.length);
+          visibilityNodes.push({x:p.x,y:p.y,ang:p.ang,type:"arc",center:{x:curr.x,y:curr.y},radius:R,polyIndex:pi,vertexIndex:vi});
+        }
+      }
+      for(let k=0;k+1<idxs.length;k++){
+        const i=idxs[k],j=idxs[k+1];
+        const a=visibilityNodes[i],b=visibilityNodes[j];
+        const dAng=Math.abs(normalizeAngle(b.ang-a.ang)),w=R*dAng;
+        arcEdges.push({a:i,b:j,w});arcEdges.push({a:j,b:i,w});
+      }
+    }
+  }
+}
+function buildVisibilityZero(){
+  visibilityNodes=[];
+  visibilityNodes.push({x:startPoint.x,y:startPoint.y,type:"start"});
+  visibilityNodes.push({x:endPoint.x,y:endPoint.y,type:"end"});
+  const ranges=[];
+  for(let pi=0;pi<polygons.length;pi++){
+    const poly=polygons[pi],base=visibilityNodes.length;
+    for(let vi=0;vi<poly.length;vi++){
+      const v=poly[vi];visibilityNodes.push({x:v.x,y:v.y,type:"vertex",polyIndex:pi,vertexIndex:vi});
+    }
+    ranges.push({base,count:poly.length});
+  }
+  const n=visibilityNodes.length;
+  graphAdj=new Array(n).fill(0).map(()=>[]);
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){
+    if(segmentValidZero(visibilityNodes[i],visibilityNodes[j])){
+      const w=dist(visibilityNodes[i],visibilityNodes[j]);graphAdj[i].push({to:j,w});graphAdj[j].push({to:i,w});
+    }
+  }
+  for(const r of ranges){
+    const c=r.count,b=r.base;
+    for(let k=0;k<c;k++){
+      const i=b+k,j=b+((k+1)%c),w=dist(visibilityNodes[i],visibilityNodes[j]);
+      graphAdj[i].push({to:j,w});graphAdj[j].push({to:i,w});
+    }
+  }
+  pathDirty=true;distMapDirty=true;heatmapVersion++;needOffscreenRebuild=true;
+}
+function buildVisibilityStatic(){
+  useZeroMode=(objectRadiusUnits<=EPS);
+  if(useZeroMode){buildVisibilityZero();return;}
+  buildNodesWithArcs();
+  const n=visibilityNodes.length;
+  graphAdj=new Array(n).fill(0).map(()=>[]);
+  for(let i=2;i<n;i++)for(let j=i+1;j<n;j++){
+    if(segmentValidClearance(visibilityNodes[i],visibilityNodes[j])){
+      const w=dist(visibilityNodes[i],visibilityNodes[j]);graphAdj[i].push({to:j,w});graphAdj[j].push({to:i,w});
+    }
+  }
+  for(const e of arcEdges) graphAdj[e.a].push({to:e.b,w:e.w,arc:true});
+  pathDirty=true;distMapDirty=true;heatmapVersion++;needOffscreenRebuild=true;
+}
+function recomputeStartEndEdges(){
+  if(visibilityNodes.length<2)return;
+  visibilityNodes[0].x=startPoint.x;visibilityNodes[0].y=startPoint.y;
+  visibilityNodes[1].x=endPoint.x;visibilityNodes[1].y=endPoint.y;
+  for(let i=0;i<graphAdj.length;i++) graphAdj[i]=graphAdj[i].filter(e=>e.to!==0&&e.to!==1);
+  graphAdj[0]=[];graphAdj[1]=[];
+  const n=visibilityNodes.length;
+  const segOK=useZeroMode?segmentValidZero:segmentValidClearance;
+  for(let j=1;j<n;j++) if(segOK(visibilityNodes[0],visibilityNodes[j])){const w=dist(visibilityNodes[0],visibilityNodes[j]);graphAdj[0].push({to:j,w});graphAdj[j].push({to:0,w});}
+  for(let j=0;j<n;j++) if(segOK(visibilityNodes[1],visibilityNodes[j])){const w=dist(visibilityNodes[1],visibilityNodes[j]);graphAdj[1].push({to:j,w});graphAdj[j].push({to:1,w});}
+  if(segOK(visibilityNodes[0],visibilityNodes[1])){const w=dist(visibilityNodes[0],visibilityNodes[1]);graphAdj[0].push({to:1,w});graphAdj[1].push({to:0,w});}
+  pathDirty=true;distMapDirty=true;heatmapVersion++;needOffscreenRebuild=true;
+}
+
+/* ===== Resolution selection ===== */
+function selectHeatmapCellSize(){
+  for(const lvl of heatmapLevels){
+    if(zoom<=lvl.maxZoom){ currentHeatmapCellSize=lvl.cell; break; }
+  }
+}
+
+/* ===== Rebuild sequence ===== */
+function rebuildAll(){
+  selectHeatmapCellSize();
+  rebuildInflated();
+  buildVisibilityStatic();
+  recomputeStartEndEdges();
+  setStatus();
+  needsRedraw=true;
+  needOffscreenRebuild=true;
+  requestFrame();
+}
+
+/* ===== Pathfinding ===== */
+function aStar(){
+  const startIndex=0,goalIndex=1,n=visibilityNodes.length;
+  if(n<2)return [];
+  function h(i){return dist(visibilityNodes[i],visibilityNodes[goalIndex]);}
+  const open=[],came=new Array(n).fill(-1),g=new Array(n).fill(Infinity),f=new Array(n).fill(Infinity),inOpen=new Array(n).fill(false);
+  function push(i){open.push(i);inOpen[i]=true;}
+  function popLowest(){let bi=0,bf=f[open[0]];for(let k=1;k<open.length;k++){const idx=open[k],fv=f[idx];if(fv<bf){bi=k;bf=fv;}}const node=open[bi];open.splice(bi,1);inOpen[node]=false;return node;}
+  g[startIndex]=0;f[startIndex]=h(startIndex);push(startIndex);
+  while(open.length){
+    const cur=popLowest();
+    if(cur===goalIndex){
+      const path=[];let c=cur;
+      while(c!==-1){path.push(c);c=came[c];}
+      return path.reverse();
+    }
+    for(const {to,w} of graphAdj[cur]){
+      const ng=g[cur]+w;
+      if(ng<g[to]){
+        came[to]=cur;g[to]=ng;f[to]=ng+h(to);
+        if(!inOpen[to]) push(to);
+      }
+    }
+  }
+  return [];
+}
+function pathLength(p){let s=0;for(let i=1;i<p.length;i++) s+=dist(visibilityNodes[p[i-1]],visibilityNodes[p[i]]);return s;}
+function updatePath(){
+  if(!pathDirty) return;
+  pathIndices=aStar();
+  if(pathIndices.length){
+    const lenPx=pathLength(pathIndices);
+    pathLenEl.textContent=(lenPx/gridSize).toFixed(3);
+    const straight=dist(startPoint,endPoint);
+    detourEl.textContent=straight>EPS?(lenPx/straight).toFixed(3)+"×":"—";
+  }else{
+    pathLenEl.textContent="—";detourEl.textContent="—";
+  }
+  pathDirty=false;
+  heatmapVersion++;needOffscreenRebuild=true;
+}
+
+/* ===== Heatmap core (position-based world grid, no jitter, no edge artifacts) ===== */
+function computeDistToEnd(){
+  if(!heatmapEnabled) return;
+  const n=visibilityNodes.length;
+  distToEnd=new Array(n).fill(Infinity);
+  if(n<2){distMapDirty=false;heatmapNormMax=1;return;}
+  const goal=1;distToEnd[goal]=0;const visited=new Array(n).fill(false);
+  for(let iter=0;iter<n;iter++){
+    let u=-1,best=Infinity;
+    for(let i=0;i<n;i++) if(!visited[i] && distToEnd[i]<best){best=distToEnd[i];u=i;}
+    if(u===-1) break;
+    visited[u]=true;
+    for(const e of graphAdj[u]){
+      const v=e.to,nd=distToEnd[u]+e.w;
+      if(nd<distToEnd[v]) distToEnd[v]=nd;
+    }
+  }
+  let maxNode=0;
+  for(const d of distToEnd) if(isFinite(d)&&d>maxNode) maxNode=d;
+  heatmapNormMax=Math.max(1,maxNode+2*gridSize);
+  distMapDirty=false;
+}
+function hsvToRgb(h,s,v){
+  const c=v*s,hp=h/60,x=c*(1-Math.abs(hp%2-1));
+  let r=0,g=0,b=0;
+  if(0<=hp&&hp<1){r=c;g=x;}
+  else if(1<=hp&&hp<2){r=x;g=c;}
+  else if(2<=hp&&hp<3){g=c;b=x;}
+  else if(3<=hp&&hp<4){g=x;b=c;}
+  else if(4<=hp&&hp<5){r=x;b=c;}
+  else if(5<=hp&&hp<=6){r=c;b=x;}
+  const m=v-c;return {r:Math.round((r+m)*255),g:Math.round((g+m)*255),b:Math.round((b+m)*255)};
+}
+function redToBlueColor(t){const h=240*(1-t);const {r,g,b}=hsvToRgb(h,1,1);return `rgb(${r},${g},${b})`;}
+function pathDistanceFromPoint(p){
+  const ignoreIdx=pointInHitbox(p);
+  const segOK=(a,b)=>(useZeroMode?segmentValidZeroIgnore:segmentValidClearanceIgnore)(a,b,ignoreIdx);
+  let best=Infinity;
+  if(segOK(p,visibilityNodes[1])) best=dist(p,visibilityNodes[1]);
+  const candidates=visibilityNodes
+    .map((n,i)=>i<2?null:{i,dsq:(n.x-p.x)*(n.x-p.x)+(n.y-p.y)*(n.y-p.y)})
+    .filter(Boolean)
+    .sort((a,b)=>a.dsq-b.dsq)
+    .slice(0,64); // more samples due to very fine grid
+  for(const c of candidates){
+    if(distToEnd[c.i]===Infinity) continue;
+    const node=visibilityNodes[c.i];
+    if(segOK(p,node)){
+      const cand=Math.sqrt(c.dsq)+distToEnd[c.i];
+      if(cand<best) best=cand;
+    }
+  }
+  return best;
+}
+
+/* Build offscreen heatmap with pixel-perfect tiling (no seam/overlap) */
+function buildOffscreenHeatmap(){
+  if(!heatmapEnabled) return;
+  if(distMapDirty) computeDistToEnd();
+
+  const cell=currentHeatmapCellSize;
+  const vp=worldViewport();
+
+  // indices of world-aligned grid; this keeps positions stable while panning
+  const minIx=Math.floor(vp.minX/cell)-1;
+  const maxIx=Math.ceil(vp.maxX/cell)+1;
+  const minIy=Math.floor(vp.minY/cell)-1;
+  const maxIy=Math.ceil(vp.maxY/cell)+1;
+
+  // world->screen helpers
+  function wsx(wx){return wx*zoom+panOffset.x;}
+  function wsy(wy){return wy*zoom+panOffset.y;}
+
+  // anchor offscreen to the world-aligned origin (min cell corner)
+  const screenMinX=wsx(minIx*cell);
+  const screenMinY=wsy(minIy*cell);
+  const screenMaxX=wsx((maxIx+1)*cell);
+  const screenMaxY=wsy((maxIy+1)*cell);
+
+  const width=Math.max(1, Math.ceil(screenMaxX - screenMinX));
+  const height=Math.max(1, Math.ceil(screenMaxY - screenMinY));
+
+  offscreenHeatmapCanvas.width=width;
+  offscreenHeatmapCanvas.height=height;
+  const hctx=offscreenHeatmapCtx;
+  hctx.clearRect(0,0,width,height);
+  hctx.imageSmoothingEnabled=false;
+
+  // Build tiles
+  for(let iy=minIy;iy<=maxIy;iy++){
+    // compute exact pixel rows boundaries using ROUND to ensure adjacency without gaps/overlaps
+    const topPx = Math.round(wsy(iy*cell) - screenMinY);
+    const botPx = Math.round(wsy((iy+1)*cell) - screenMinY);
+    const hPx = botPx - topPx;
+    if(hPx<=0) continue;
+
+    for(let ix=minIx;ix<=maxIx;ix++){
+      const leftPx = Math.round(wsx(ix*cell) - screenMinX);
+      const rightPx = Math.round(wsx((ix+1)*cell) - screenMinX);
+      const wPx = rightPx - leftPx;
+      if(wPx<=0) continue;
+
+      const cacheKey = `${cell}|${ix}|${iy}|${heatmapVersion}`;
+      let cached = heatmapCellCache.get(cacheKey);
+      if(!cached){
+        const center={x:(ix+0.5)*cell,y:(iy+0.5)*cell};
+        const d=pathDistanceFromPoint(center);
+        if(!isFinite(d)){
+          cached={skip:true};
+        }else{
+          let t=1-Math.min(d,heatmapNormMax)/heatmapNormMax;
+          if(t<0)t=0;if(t>1)t=1;
+          const rgb=redToBlueColor(t);
+          const a=0.35+0.45*t; // crisp, vivid
+          cached={skip:false,color:rgb.replace('rgb','rgba').replace(')',','+a.toFixed(3)+')')};
+        }
+        heatmapCellCache.set(cacheKey,cached);
+      }
+      if(cached.skip) continue;
+
+      hctx.fillStyle = cached.color;
+      // No padding, no stroke, pixel-locked rect -> no artifacts
+      hctx.fillRect(leftPx, topPx, wPx, hPx);
+    }
+  }
+
+  // done
+  needOffscreenRebuild=false;
+  lastViewportKey=[
+    minIx,maxIx,minIy,maxIy,zoom.toFixed(4),
+    Math.round(panOffset.x),Math.round(panOffset.y),
+    heatmapVersion,cell
+  ].join("|");
+}
+
+function drawHeatmap(){
+  if(!heatmapEnabled) return;
+  selectHeatmapCellSize();
+
+  // rebuild offscreen if needed or viewport changed (grid indices changed)
+  const cell=currentHeatmapCellSize;
+  const vp=worldViewport();
+  const minIx=Math.floor(vp.minX/cell)-1;
+  const maxIx=Math.ceil(vp.maxX/cell)+1;
+  const minIy=Math.floor(vp.minY/cell)-1;
+  const maxIy=Math.ceil(vp.maxY/cell)+1;
+  const viewKey=[
+    minIx,maxIx,minIy,maxIy,zoom.toFixed(4),
+    Math.round(panOffset.x),Math.round(panOffset.y),
+    heatmapVersion,cell
+  ].join("|");
+
+  if(needOffscreenRebuild || viewKey!==lastViewportKey){
+    buildOffscreenHeatmap();
+  }
+
+  // Draw offscreen at pixel-aligned world anchor so it doesn't "swim" with panning
+  function wsx(wx){return wx*zoom+panOffset.x;}
+  function wsy(wy){return wy*zoom+panOffset.y;}
+  const screenMinX = wsx(minIx*cell);
+  const screenMinY = wsy(minIy*cell);
+
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(
+    offscreenHeatmapCanvas,
+    Math.floor(screenMinX),
+    Math.floor(screenMinY)
+  );
+}
+
+/* ===== Viewport & Drawing ===== */
+function worldViewport(){
+  const w=canvas.width,h=canvas.height;
+  const minX=(-panOffset.x)/zoom;
+  const minY=(-panOffset.y)/zoom;
+  return {minX,minY,maxX:minX+w/zoom,maxY:minY+h/zoom,w,h};
+}
+function drawGrid(){
+  if(!showLatticeToggle.checked) return;
+  const {minX,minY,maxX,maxY,w,h}=worldViewport();
+  const startX=Math.floor(minX/gridSize)*gridSize;
+  const startY=Math.floor(minY/gridSize)*gridSize;
+  ctx.strokeStyle="#121417";
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  for(let x=startX;x<=maxX;x+=gridSize){
+    const sx=x*zoom+panOffset.x;
+    ctx.moveTo(sx,0);ctx.lineTo(sx,h);
+  }
+  for(let y=startY;y<=maxY;y+=gridSize){
+    const sy=y*zoom+panOffset.y;
+    ctx.moveTo(0,sy);ctx.lineTo(w,sy);
+  }
+  ctx.stroke();
+}
+
+function drawScene(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  drawGrid();
+  drawHeatmap();
+
+  ctx.save();
+  ctx.translate(panOffset.x,panOffset.y);
+  ctx.scale(zoom,zoom);
+
+  const R=objectRadiusUnits*gridSize;
+  if(heatmapEnabled && R>EPS){
+    ctx.fillStyle="#000";
+    inflatedPolygons.forEach(poly=>{
+      if(poly.length<2)return;
+      ctx.beginPath();
+      ctx.moveTo(poly[0].x,poly[0].y);
+      for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x,poly[i].y);
+      ctx.closePath();
+      ctx.fill();
+    });
+  }
+
+  ctx.fillStyle="#000";
+  polygons.forEach(poly=>{
+    if(poly.length<2)return;
+    ctx.beginPath();
+    ctx.moveTo(poly[0].x,poly[0].y);
+    for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x,poly[i].y);
+    ctx.closePath();
+    ctx.fill();
+  });
+
+  polygons.forEach(poly=>{
+    if(poly.length<2)return;
+    if(!heatmapEnabled){
+      ctx.beginPath();
+      ctx.moveTo(poly[0].x,poly[0].y);
+      for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x,poly[i].y);
+      ctx.closePath();
+      ctx.strokeStyle="#666";
+      ctx.lineWidth=1.2/zoom;
+      ctx.stroke();
+    }
+    ctx.fillStyle="#888";
+    poly.forEach(v=>{
+      ctx.beginPath();
+      ctx.arc(v.x,v.y,3.5/zoom,0,Math.PI*2);
+      ctx.fill();
+    });
+  });
+
+  if(constructing&&currentPoly.length){
+    ctx.beginPath();
+    ctx.moveTo(currentPoly[0].x,currentPoly[0].y);
+    for(let i=1;i<currentPoly.length;i++) ctx.lineTo(currentPoly[i].x,currentPoly[i].y);
+    ctx.strokeStyle="#aaa";
+    ctx.lineWidth=1.2/zoom;
+    ctx.setLineDash([6/zoom,4/zoom]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle="#aaa";
+    currentPoly.forEach((v,i)=>{
+      ctx.beginPath();
+      ctx.arc(v.x,v.y,4.5/zoom,0,Math.PI*2);
+      ctx.fill();
+      if(showIndicesToggle.checked){
+        ctx.fillStyle="#bbb";
+        ctx.font=`${10/zoom}px monospace`;
+        ctx.textAlign="left";
+        ctx.textBaseline="top";
+        ctx.fillText(i,v.x+5/zoom,v.y+5/zoom);
+        ctx.fillStyle="#aaa";
+      }
+    });
+  }
+
+  if(showGraphToggle.checked&&visibilityNodes.length){
+    ctx.strokeStyle="#333";
+    ctx.lineWidth=1/zoom;
+    ctx.beginPath();
+    for(let i=0;i<graphAdj.length;i++){
+      const a=visibilityNodes[i];
+      for(const e of graphAdj[i]) if(e.to>i){
+        const b=visibilityNodes[e.to];
+        ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
+      }
+    }
+    ctx.stroke();
+  }
+
+  updatePath();
+  if(pathIndices.length>=2){
+    ctx.strokeStyle="#fff";
+    ctx.lineWidth=3/zoom;
+    ctx.beginPath();
+    const first=visibilityNodes[pathIndices[0]];
+    ctx.moveTo(first.x,first.y);
+    for(let i=1;i<pathIndices.length;i++){
+      const n=visibilityNodes[pathIndices[i]];
+      ctx.lineTo(n.x,n.y);
+    }
+    ctx.stroke();
+  }
+
+  function drawPoint(p,label){
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,p.r/zoom,0,Math.PI*2);
+    ctx.fillStyle=p.color;ctx.fill();
+    ctx.lineWidth=2/zoom;ctx.strokeStyle="#222";ctx.stroke();
+    ctx.fillStyle=(p.color==="#ffffff")?"#000":"#fff";
+    ctx.font=`${10/zoom}px sans-serif`;
+    ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText(label,p.x,p.y);
+  }
+  drawPoint(startPoint,"S");
+  drawPoint(endPoint,"E");
+
+  if(showIndicesToggle.checked){
+    ctx.font=`${10/zoom}px monospace`;
+    ctx.textAlign="center";
+    ctx.textBaseline="top";
+    ctx.fillStyle="#999";
+    visibilityNodes.forEach((n,i)=>{
+      if(n.type==="vertex"){
+        ctx.fillText(i,n.x,n.y+8/zoom);
+      }else if(n.type==="arc"){
+        const deg=((n.ang*180/Math.PI)%360+360)%360;
+        ctx.fillText(deg.toFixed(0),n.x,n.y+8/zoom);
+      }
+    });
+  }
+
+  ctx.restore();
+}
+
+/* ===== Render Loop ===== */
+function requestFrame(){ if(!animationRunning){ animationRunning=true; requestAnimationFrame(loop);} }
+function loop(){ if(needsRedraw){ drawScene(); needsRedraw=false; } animationRunning=false; }
+
+/* ===== Coordinate Helpers ===== */
+function screenToWorld(pt){return {x:(pt.x-panOffset.x)/zoom,y:(pt.y-panOffset.y)/zoom};}
+function getMousePos(e){const r=canvas.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top};}
+function snapIfEnabled(pt){
+  if(!snapToggle.checked) return pt;
+  const all=[];polygons.forEach(poly=>poly.forEach(v=>all.push(v)));
+  const radius=8/zoom;let nearest=null,best=radius+1;
+  for(const v of all){const d=dist(pt,v);if(d<best){best=d;nearest=v;}}
+  return nearest?{x:nearest.x,y:nearest.y}:pt;
+}
+function polyAtPoint(worldPt,edgeTol=6){
+  const tol=edgeTol/zoom;
+  for(let p=polygons.length-1;p>=0;p--){
+    const poly=polygons[p];
+    if(pointInPolygon(worldPt,poly)) return p;
+    for(let i=0;i<poly.length;i++){
+      const v1=poly[i],v2=poly[(i+1)%poly.length];
+      if(pointSegmentDistance(worldPt,v1,v2)<=tol) return p;
+    }
+  }
+  return -1;
+}
+
+/* ===== Events ===== */
+canvas.addEventListener("contextmenu",e=>e.preventDefault());
+canvas.addEventListener("wheel",e=>{
+  e.preventDefault();
+  panOffset.x-=e.deltaX;
+  panOffset.y-=e.deltaY;
+  needsRedraw=true;
+  needOffscreenRebuild=true; // viewport moved (but cache values reused)
+  requestFrame();
+},{passive:false});
+
+canvas.addEventListener("mousedown",e=>{
+  const sp=getMousePos(e);
+  lastMouseScreen=sp;
+  mouseDownInfo={btn:e.button,pos:sp,time:performance.now()};
+  if(e.button===1||e.button===2){
+    panning=true;
+    panStart=sp;
+    panOffsetStart={x:panOffset.x,y:panOffset.y};
+    return;
+  }
+  const world=screenToWorld(sp);
+  const startScreen={x:startPoint.x*zoom+panOffset.x,y:startPoint.y*zoom+panOffset.y};
+  const endScreen={x:endPoint.x*zoom+panOffset.x,y:endPoint.y*zoom+panOffset.y};
+  if(dist(sp,startScreen)<=startPoint.r+4){
+    draggingPoint=startPoint;
+    dragOffset={x:startPoint.x-world.x,y:startPoint.y-world.y};
+    return;
+  }
+  if(dist(sp,endScreen)<=endPoint.r+4){
+    draggingPoint=endPoint;
+    dragOffset={x:endPoint.x-world.x,y:endPoint.y-world.y};
+    return;
+  }
+});
+canvas.addEventListener("mousemove",e=>{
+  const sp=getMousePos(e);
+  lastMouseScreen=sp;
+  if(panning){
+    panOffset.x=panOffsetStart.x+(sp.x-panStart.x);
+    panOffset.y=panOffsetStart.y+(sp.y-panStart.y);
+    needsRedraw=true;
+    needOffscreenRebuild=true;
+    requestFrame();
+    return;
+  }
+  if(draggingPoint){
+    const world=screenToWorld(sp);
+    draggingPoint.x=world.x+dragOffset.x;
+    draggingPoint.y=world.y+dragOffset.y;
+    recomputeStartEndEdges(); // structural -> recompute
+    setStatus();
+    needsRedraw=true;
+    needOffscreenRebuild=true;
+    requestFrame();
+  }
+});
+function finishCurrentPolygon(){
+  if(!constructing)return;
+  if(currentPoly.length<3){toast("Polygon needs ≥3 vertices");return;}
+  polygons.push(currentPoly.slice());
+  constructing=false;
+  currentPoly=[];
+  requestRebuildAll(10);
+  toast("Polygon added");
+}
+function handleClick(world){
+  if(!constructing){
+    const idx=polyAtPoint(world,6);
+    if(idx!==-1){
+      polygons.splice(idx,1);
+      requestRebuildAll(10);
+      toast("Polygon removed");
+      return;
+    }
+    constructing=true;
+    currentPoly=[];
+    currentPoly.push(snapIfEnabled(world));
+    needsRedraw=true;
+    requestFrame();
+  }else{
+    if(currentPoly.length>=3 && dist(world,currentPoly[0])<=10/zoom){
+      finishCurrentPolygon();
+      return;
+    }
+    currentPoly.push(snapIfEnabled(world));
+    needsRedraw=true;
+    requestFrame();
+  }
+}
+function endPointer(e){
+  const sp=getMousePos(e);
+  lastMouseScreen=sp;
+  if(draggingPoint){
+    draggingPoint=null;
+    recomputeStartEndEdges();
+    needOffscreenRebuild=true;
+  }
+  if(panning) panning=false;
+  if(mouseDownInfo && mouseDownInfo.btn===0){
+    const moved=Math.hypot(sp.x-mouseDownInfo.pos.x,sp.y-mouseDownInfo.pos.y);
+    if(moved<5){
+      const world=screenToWorld(sp);
+      handleClick(world);
+    }
+  }
+  mouseDownInfo=null;
+  setStatus();
+  needsRedraw=true;
+  requestFrame();
+}
+canvas.addEventListener("mouseup",endPointer);
+canvas.addEventListener("mouseleave",endPointer);
+
+window.addEventListener("keydown",(e)=>{
+  if(e.code==="ArrowUp"||e.code==="ArrowDown"){
+    e.preventDefault();
+    const scale=e.code==="ArrowUp"?1.2:1/1.2;
+    const newZoom=clamp(zoom*scale,minZoom,maxZoom);
+    if(newZoom!==zoom){
+      const anchor=lastMouseScreen;
+      const worldBefore=screenToWorld(anchor);
+      zoom=newZoom;
+      panOffset.x=anchor.x-worldBefore.x*zoom;
+      panOffset.y=anchor.y-worldBefore.y*zoom;
+      selectHeatmapCellSize();
+      needOffscreenRebuild=true; // new cell size grid
+      needsRedraw=true;
+      requestFrame();
+    }
+  }
+});
+
+/* ===== Buttons & Toggles ===== */
+undoBtn.addEventListener("click",()=>{
+  if(constructing&&currentPoly.length){
+    currentPoly.pop();
+    needsRedraw=true;
+    requestFrame();
+  }
+});
+cancelBtn.addEventListener("click",()=>{
+  if(constructing){
+    constructing=false;
+    currentPoly=[];
+    toast("Canceled polygon");
+    needsRedraw=true;
+    requestFrame();
+  }
+});
+clearBtn.addEventListener("click",()=>{
+  polygons.length=0;
+  inflatedPolygons=[];
+  constructing=false;
+  currentPoly=[];
+  heatmapCellCache.clear();
+  requestRebuildAll(10);
+  toast("Cleared");
+});
+
+showHeatmapToggle.addEventListener("change",()=>{
+  heatmapEnabled=showHeatmapToggle.checked;
+  if(!heatmapEnabled){
+    inflatedPolygons=[];
+  }else{
+    rebuildInflated();
+  }
+  needOffscreenRebuild=true;
+  needsRedraw=true;
+  requestFrame();
+});
+showLatticeToggle.addEventListener("change",()=>{needsRedraw=true;requestFrame();});
+showGraphToggle.addEventListener("change",()=>{needsRedraw=true;requestFrame();});
+showIndicesToggle.addEventListener("change",()=>{needsRedraw=true;requestFrame();});
+objectRadiusInput.addEventListener("input",()=>{
+  objectRadiusUnits=parseFloat(objectRadiusInput.value)||0;
+  objectValEl.textContent=objectRadiusUnits.toFixed(2);
+  requestRebuildAll(40);
+});
+
+function requestRebuildAll(delay=50){
+  if(rebuildTimer) clearTimeout(rebuildTimer);
+  rebuildTimer=setTimeout(()=>{rebuildAll();},delay);
+}
+
+/* ===== Init ===== */
+heatmapEnabled=showHeatmapToggle.checked;
+rebuildAll();
+setStatus();
+requestFrame();
+
+})();
+</script>
+</body>
+</html>
